@@ -42,9 +42,7 @@ RATE = 22050
 CHUNK = 2048
 
 ## threads #####################################
-
-
-
+################################################
 
 class AudioRecorder(QObject):
     '''
@@ -54,7 +52,7 @@ class AudioRecorder(QObject):
     '''
     
     def __init__(self, queue,  rate = RATE, chunk = CHUNK, input_device_index=0): 
-#rate = librosa default
+        #rate = librosa default
         QObject.__init__(self) #getting all the qthread stuff
         self.rate = rate
         self.chunk = chunk
@@ -70,7 +68,6 @@ class AudioRecorder(QObject):
                                   stream_callback = self._callback)
         self.stop = False
         
-    #def startStream(self):
     def stopStream(self):
         self.stream.stop_stream()
         self.stream.close()
@@ -84,7 +81,8 @@ class AudioRecorder(QObject):
         data = np.frombuffer(in_data, "float32")
         self.queue.put(data)
         return (data, pyaudio.paContinue)
-    
+
+
 class Chromatizer(QObject):
     '''
     Chromatizer(QObject): accepts chunks of audio information as input
@@ -121,15 +119,61 @@ class Chromatizer(QObject):
 
 class OnlineDTW(QObject):
     
-    def __init__(self, inputqueue, score_chroma):
+    def __init__(self, score_chroma):
         QObject.__init__(self)
-        self.inputqueue = inputqueue
         self.scoreChroma = score_chroma
-
-    def _getInc(self):
+    #### parameters ###############################
+        self.search_band_size = 200
+        self.weight = 0.9
+        self.maxRunCount = 3
+    ###############################################
+    #### distance matrices ########################
+        self.globalCostMatrix = None
 
     @pyqtSlot(object)
-    def compare(self, frame
+    def align(self):
+        """
+        OnlineDTW.align(): finds the best alignment between two chromagrams
+        and returns the position of the best alignment in the global cost matrix.
+        see dixon 2005 online dtw for algorithm details. 
+        also received much help from Bochen Li and his reference version in Matlab. 
+        """
+
+        previous = None
+        inputindex = 0
+        scoreindex = 0
+
+        framenumscore = len(self.scoreChroma[0])
+        framenumaudio = int(1.5 * framenumscore)
+
+        self.globalCostMatrix = np.matrix(np.ones((framenumscore, framenumaudio)) * np.inf)
+        localCostMatrix = np.matrix(np.ones((framenumscore, framenumaudio)) * np.inf)  
+
+        pathcost = self._evaluatePathCost(inputindex, scoreindex)
+
+        direction, x, y = self._getInc(inputindex, scoreindex)
+
+
+
+    def _getInc(self, inputindex, scoreindex):
+    """_getInc: takes input index, score index as arguments and returns a char where:
+             B = both
+             C = column
+             R = row
+        which indicates the direction of the algorithm's calculation.
+    """
+        if inputIndex < frameSize:
+            return "B"
+        if runCount > self.maxRunCount:
+            if previous == "R":
+                return "C"
+            else:
+                return "R"
+        x, y = np.argmin
+
+    def _evaluatePathCost(self, inputindex, scoreindex):
+        ## some kind of cost calculation function here
+        ## probably a good idea to borrow from dixon? but maybe better funcitons exist
 
 class Reader(QObject):
     signalToChromatizer = pyqtSignal(object)
@@ -227,8 +271,8 @@ class MusicXMLprocessor:
                 parts_and_voices.append(part)
         #duration for calculations later
         length_score_seconds = score.seconds
-##########################################################
-######### extracting note names and indexes by part ######
+        ################################################
+        #extracting note names and indexes by part 
         #a chroma node is a tuple which contains:
         #    the pitch(es) of a particular frame
         #        (if there's only one, type(pitch)  == str
@@ -242,17 +286,17 @@ class MusicXMLprocessor:
         # these nodes are stored in a dictionary, chroma_nodes_per_part
         # where the key == a part in the piece
         # and value == list of chroma nodes in that part.
+        ################################################
         chroma_nodes_per_part= {}
         chroma_vector_per_part = {}
 
         for i in range(len(parts_and_voices)):
            
-# cover all parts
-# print("Debug: parts[i]._getSeconds()", parts[i]._getSeconds())
+        # cover all parts
             chroma_nodes_per_part[parts_and_voices[i].partName] = []
-#each part is key in dict, list of notes in each part
+            #each part is key in dict, list of notes in each part
             for note in parts_and_voices[i].flat.notes:
-#cover all notes in specific part
+            #cover all notes in specific part
                 if not chroma_nodes_per_part[parts_and_voices[i].partName] and not note.isChord:
                     start = 0
                     end = note.seconds + start
@@ -260,7 +304,6 @@ class MusicXMLprocessor:
                     chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node)
 
                 elif chroma_nodes_per_part[parts_and_voices[i].partName] and not note.isChord:
-#print(chroma_tuples_per_part[parts[i].partName][j-1])
                     start = chroma_nodes_per_part[parts_and_voices[i].partName][-1][2]
                     end = note.seconds + start
                     chroma_node = (note.name, start, end)
@@ -285,7 +328,6 @@ class MusicXMLprocessor:
 ## generating chroma vectors for each part ##################
         num_of_frames = 0
         for part in chroma_nodes_per_part:
-            
            # print("part:", part)
             chroma_vector_per_part[part] = [[],
                                             [],
@@ -299,8 +341,6 @@ class MusicXMLprocessor:
                                             [],
                                             [],
                                             []]
-
-
             for i in np.arange(0, length_score_seconds, ((CHUNK/4)/RATE)):                
                 notes_in_frame = []
                 chroma_in_frame = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
@@ -343,6 +383,9 @@ class MusicXMLprocessor:
         self.chroma = chroma_normed   
         return self.chroma
 
+#####################################################
+## Qt app instantiation -> thread setup
+#####################################################
 class App(QMainWindow):
     
     def __init__(self):
@@ -383,6 +426,7 @@ class App(QMainWindow):
     def signalsandSlots(self):
         self.reader.signalToChromatizer.connect(self.chromatizer.calculate)
 
+## currently just testing but u know...will be other things soon. 
 if __name__ == "__main__":
     musicxmlparser = MusicXMLprocessor("/Users/hypatia/Qt_projects/wtq.xml")
     chroma = musicxmlparser.musicXMLtoChroma()
@@ -393,4 +437,4 @@ if __name__ == "__main__":
     mainwindow = App()
     mainwindow.show()
     exit_code = app.exec_()
-sys.exit(exit_code)
+    sys.exit(exit_code)
