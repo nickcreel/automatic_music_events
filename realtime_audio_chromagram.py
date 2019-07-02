@@ -93,6 +93,7 @@ class Chromatizer(QObject):
     reference chroma. Currently prints value of fundamental frequency
     of audio chunk. 
     '''
+    signalToOnlineDTW = pyqtSignal(object)
     def __init__(self, inputqueue, outputqueue):
         QObject.__init__(self)
         self.outputqueue = outputqueue
@@ -116,6 +117,19 @@ class Chromatizer(QObject):
                                                 size = (1,9))
         self.outputqueue.put(chroma_smooth)
         print(np.argmax(np.mean(chroma_smooth,axis=1)))
+        
+
+class OnlineDTW(QObject):
+    
+    def __init__(self, inputqueue, score_chroma):
+        QObject.__init__(self)
+        self.inputqueue = inputqueue
+        self.scoreChroma = score_chroma
+
+    def _getInc(self):
+
+    @pyqtSlot(object)
+    def compare(self, frame
 
 class Reader(QObject):
     signalToChromatizer = pyqtSignal(object)
@@ -142,7 +156,7 @@ class MusicXMLprocessor:
     '''
     def __init__(self, filename):
         self.file = filename
-# self.chroma[0] = C, ..., self.chroma[11] = B
+        # self.chroma[0] = C, ..., self.chroma[11] = B
         self.chroma = np.array([[],
                                 [],
                                 [],
@@ -155,8 +169,8 @@ class MusicXMLprocessor:
                                 [],
                                 [],
                                 []])
-#key = note name
-#value = chroma index for chroma matrix 
+        #key = note name
+        #value = chroma index for chroma matrix 
         self._chromaToIndex = {'C':0,
                                 'C#':1,
                                 'D-':1,
@@ -175,9 +189,9 @@ class MusicXMLprocessor:
                                 'B-':10,
                                 'B':11}
 
-#key = chroma index for a particular note (see chroma to index)
-#value = for each chroma index, amplitude of fund. freq. and partials
-#see https://en.wikipedia.org/wiki/Harmonic_series_(music)
+        #key = chroma index for a particular note (see chroma to index)
+        #value = for each chroma index, amplitude of fund. freq. and partials
+        #see https://en.wikipedia.org/wiki/Harmonic_series_(music)
         self._cOvertones = np.array([1.825,0,0,0,.2,0,0,.5,0,0,.143,0])
         self._harmonics = {}
         for i in range(0,12):
@@ -185,7 +199,9 @@ class MusicXMLprocessor:
 
     def musicXMLtoChroma(self):
         importer = musicxml.xmlToM21.MusicXMLImporter()
-        
+        #because tempo is impossible to get with music21 for some reason
+        #i'm extracting it directly from the xml using a parser
+        #it's very dinky but works...
         root = ET.parse(self.file).getroot()
         beatUnit = ""
         perMinute = ""
@@ -193,91 +209,102 @@ class MusicXMLprocessor:
             beatUnit = attribute.text
         for attribute in root.iter('per-minute'):
             perMinute = attribute.text
+        #load file
         score = importer.scoreFromFile(self.file)
-        #score.show()
+        #must make tempo a metronome mark object to attach to music21 streams
         scoreTempo = tempo.MetronomeMark(None, int(perMinute), beatUnit)        
-       # print("Debug: scoreTempo", scoreTempo)
         score.insert(scoreTempo)
         #print("Debug: score.seconds",score.seconds)
         parts_extracted = score.parts
         parts_and_voices = []
         for part in parts_extracted:
             part.insert(scoreTempo)
-            if part.hasPartLikeStreams():
-             #   print(part.partName, "has part-like substream")
+            if part.hasVoices():
+                #voices could get lost if not extracted separately...
                 for voice in part.voices:
                     parts_and_voices.append(voice)
             else:
-               # print(part.partName, "doesn't have part-like substream")
-               # print(part.hasVoices())
-
                 parts_and_voices.append(part)
+        #duration for calculations later
         length_score_seconds = score.seconds
+##########################################################
 ######### extracting note names and indexes by part ######
-        chroma_nodes= {}
-        chroma_per_part = {}
+        #a chroma node is a tuple which contains:
+        #    the pitch(es) of a particular frame
+        #        (if there's only one, type(pitch)  == str
+        #         else, type(pitches) == list
+        #    the start time of those pitches
+        #        (which is 0 if the pitch is first
+        #         or the end of the previous note if
+        #         i > 0)
+        #    the end time of those pitches
+        #         (duration of pitch in seconds + start time)
+        # these nodes are stored in a dictionary, chroma_nodes_per_part
+        # where the key == a part in the piece
+        # and value == list of chroma nodes in that part.
+        chroma_nodes_per_part= {}
+        chroma_vector_per_part = {}
 
         for i in range(len(parts_and_voices)):
            
 # cover all parts
 # print("Debug: parts[i]._getSeconds()", parts[i]._getSeconds())
-            chroma_nodes[parts_and_voices[i].partName] = []
+            chroma_nodes_per_part[parts_and_voices[i].partName] = []
 #each part is key in dict, list of notes in each part
             for note in parts_and_voices[i].flat.notes:
 #cover all notes in specific part
-                if not chroma_nodes[parts_and_voices[i].partName] and not note.isChord:
+                if not chroma_nodes_per_part[parts_and_voices[i].partName] and not note.isChord:
                     start = 0
                     end = note.seconds + start
                     chroma_node = (note.name, start, end)
-                    chroma_nodes[parts_and_voices[i].partName].append(chroma_node)
+                    chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node)
 
-                elif chroma_nodes[parts_and_voices[i].partName] and not note.isChord:
+                elif chroma_nodes_per_part[parts_and_voices[i].partName] and not note.isChord:
 #print(chroma_tuples_per_part[parts[i].partName][j-1])
-                    start = chroma_nodes[parts_and_voices[i].partName][-1][2]
+                    start = chroma_nodes_per_part[parts_and_voices[i].partName][-1][2]
                     end = note.seconds + start
                     chroma_node = (note.name, start, end)
-                    chroma_nodes[parts_and_voices[i].partName].append(chroma_node)
-                elif not chroma_nodes[parts_and_voices[i].partName] and note.isChord:
+                    chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node)
+                elif not chroma_nodes_per_part[parts_and_voices[i].partName] and note.isChord:
                     note_temp = []
                     for pitch in note.pitches:
                         note_temp.append(pitch.name)
                     start = 0
                     end = note.seconds + start
                     chroma_node = (note_temp, start, end)
-                    chroma_nodes[parts_and_voices[i].partName].append(chroma_node)
-                elif chroma_nodes[parts_and_voices[i].partName] and note.isChord:
+                    chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node)
+                elif chroma_nodes_per_part[parts_and_voices[i].partName] and note.isChord:
                     note_temp = []
                     for pitch in note.pitches:
                         note_temp.append(pitch.name)
-                    start = chroma_nodes[parts_and_voices[i].partName][-1][2]
+                    start = chroma_nodes_per_part[parts_and_voices[i].partName][-1][2]
                     end = note.seconds + start
                     chroma_node = (note_temp,start,end)
-                    chroma_nodes[parts_and_voices[i].partName].append(chroma_node)
-        #print("Debug: chroma_nodes", chroma_nodes)
-## generating chroma vectors for each part #####################
+                    chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node)
+#############################################################                    
+## generating chroma vectors for each part ##################
         num_of_frames = 0
-        for part in chroma_nodes:
+        for part in chroma_nodes_per_part:
             
            # print("part:", part)
-            chroma_per_part[part] = [[],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    [],
-                                    []]
+            chroma_vector_per_part[part] = [[],
+                                            [],
+                                            [],
+                                            [],
+                                            [],
+                                            [],
+                                            [],
+                                            [],
+                                            [],
+                                            [],
+                                            [],
+                                            []]
 
 
             for i in np.arange(0, length_score_seconds, ((CHUNK/4)/RATE)):                
-                # print(num_of_frames)
                 notes_in_frame = []
                 chroma_in_frame = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
-                for node in chroma_nodes[part]:
+                for node in chroma_nodes_per_part[part]:
                     if node[1] < i and i < node[2] and type(node[0]) == str:
                         #if in current frame and only one note
                         #print(node)
@@ -288,32 +315,31 @@ class MusicXMLprocessor:
                         note_index = []
                         for note in node[0]:
                             note_index = self._chromaToIndex[note]
-
-                       
                             if note_index not in notes_in_frame:
                                 notes_in_frame.append(note_index)
-                    #    print(notes_in_frame)
                     elif node[2] > i:
                         break
                                    
                 for note in notes_in_frame:
                     if type(note) == int:
                         chroma_in_frame +=  self._harmonics[note]
-               # print("Chroma in frame:", chroma_in_frame)
-               # print("length of Chroma in frame:", len(chroma_in_frame))
                 for j in range(len(chroma_per_part[part])):
                     num_of_frames = len(chroma_per_part[part][j])+1
-                    chroma_per_part[part][j].append(chroma_in_frame[j])
-        #print(chroma_per_part) 
+                    chroma_vector_per_part[part][j].append(chroma_in_frame[j]) 
+
         full_chroma = np.zeros((12, num_of_frames))
         for part in chroma_per_part:
-            chroma_per_part[part] = np.array(chroma_per_part[part])
+            chroma_vector_per_part[part] = np.array(chroma_vector_per_part[part])
             for i in range(len(chroma_per_part[part])):
-                full_chroma[i] += chroma_per_part[part][i] 
+                full_chroma[i] += chroma_vector_per_part[part][i] 
 
         chroma_normed = full_chroma / full_chroma.max(axis=0)
+        #norming columnwise to preserve intensity of each note that has been 
+        #played in a particular frame. if we didnt, polyphonic frames
+        #would be artificially "louder" than monophonic frames.
         np.place(chroma_normed, np.isnan(chroma_normed), [0])
-        #print("self.chroma:", self.chroma)
+        #any values that are nan are 0/0, which means they should be 0
+        #anyway. a row that sums to 0 means silence, which we should preserve. 
         self.chroma = chroma_normed   
         return self.chroma
 
