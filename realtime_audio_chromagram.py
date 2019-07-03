@@ -116,7 +116,7 @@ class Chromatizer(QObject):
         self.outputqueue.put(chroma_smooth)
         print(np.argmax(np.mean(chroma_smooth,axis=1)))
         
-
+"""
 class OnlineDTW(QObject):
     
     def __init__(self, score_chroma):
@@ -132,12 +132,12 @@ class OnlineDTW(QObject):
 
     @pyqtSlot(object)
     def align(self):
-        """
+        
         OnlineDTW.align(): finds the best alignment between two chromagrams
         and returns the position of the best alignment in the global cost matrix.
         see dixon 2005 online dtw for algorithm details. 
         also received much help from Bochen Li and his reference version in Matlab. 
-        """
+        
 
         previous = None
         inputindex = 0
@@ -156,12 +156,11 @@ class OnlineDTW(QObject):
 
 
     def _getInc(self, inputindex, scoreindex):
-    """_getInc: takes input index, score index as arguments and returns a char where:
-             B = both
-             C = column
-             R = row
-        which indicates the direction of the algorithm's calculation.
-    """
+    _getInc: takes input index, score index as arguments and returns a char where:
+    B = both
+    C = column
+    R = row
+    which indicates the direction of the algorithm's calculation.
         if inputIndex < frameSize:
             return "B"
         if runCount > self.maxRunCount:
@@ -174,6 +173,7 @@ class OnlineDTW(QObject):
     def _evaluatePathCost(self, inputindex, scoreindex):
         ## some kind of cost calculation function here
         ## probably a good idea to borrow from dixon? but maybe better funcitons exist
+""" 
 
 class Reader(QObject):
     signalToChromatizer = pyqtSignal(object)
@@ -263,6 +263,7 @@ class MusicXMLprocessor:
         parts_and_voices = []
         for part in parts_extracted:
             part.insert(scoreTempo)
+            print(part.partName, part.seconds)
             if part.hasVoices():
                 #voices could get lost if not extracted separately...
                 for voice in part.voices:
@@ -295,7 +296,7 @@ class MusicXMLprocessor:
         # cover all parts
             chroma_nodes_per_part[parts_and_voices[i].partName] = []
             #each part is key in dict, list of notes in each part
-            for note in parts_and_voices[i].flat.notes:
+            for note in parts_and_voices[i].flat.notesAndRests:
             #cover all notes in specific part
                 if not chroma_nodes_per_part[parts_and_voices[i].partName] and not note.isChord:
                     start = 0
@@ -328,7 +329,7 @@ class MusicXMLprocessor:
 ## generating chroma vectors for each part ##################
         num_of_frames = 0
         for part in chroma_nodes_per_part:
-           # print("part:", part)
+            print("part:", part)
             chroma_vector_per_part[part] = [[],
                                             [],
                                             [],
@@ -345,32 +346,40 @@ class MusicXMLprocessor:
                 notes_in_frame = []
                 chroma_in_frame = np.array([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0])
                 for node in chroma_nodes_per_part[part]:
-                    if node[1] < i and i < node[2] and type(node[0]) == str:
+                    if node[1] < i and i <= node[2] and type(node[0]) == str:
                         #if in current frame and only one note
                         #print(node)
-                        notes_in_frame.append(self._chromaToIndex[node[0]])
-                    elif node[1] < i and i<node[2] and type(node[0]) == list:
+                        if node[0] in self._chromaToIndex:
+                            notes_in_frame.append(self._chromaToIndex[node[0]])
+                        else:
+                            notes_in_frame.append("R")
+                    elif node[1] < i and i<= node[2] and type(node[0]) == list:
                         #if in current frame and multiple notes
                         #print(node[0])
                         note_index = []
                         for note in node[0]:
-                            note_index = self._chromaToIndex[note]
+                            if note in self._chromaToIndex:
+                                note_index = self._chromaToIndex[note]
+                            elif note == "R":
+                                pass
                             if note_index not in notes_in_frame:
                                 notes_in_frame.append(note_index)
                     elif node[2] > i:
                         break
-                                   
+                print(notes_in_frame)                   
                 for note in notes_in_frame:
                     if type(note) == int:
                         chroma_in_frame +=  self._harmonics[note]
-                for j in range(len(chroma_per_part[part])):
-                    num_of_frames = len(chroma_per_part[part][j])+1
+                    elif note == "R":
+                        pass
+                for j in range(len(chroma_vector_per_part[part])):
+                    num_of_frames = len(chroma_vector_per_part[part][j])+1
                     chroma_vector_per_part[part][j].append(chroma_in_frame[j]) 
 
         full_chroma = np.zeros((12, num_of_frames))
-        for part in chroma_per_part:
+        for part in chroma_vector_per_part:
             chroma_vector_per_part[part] = np.array(chroma_vector_per_part[part])
-            for i in range(len(chroma_per_part[part])):
+            for i in range(len(chroma_vector_per_part[part])):
                 full_chroma[i] += chroma_vector_per_part[part][i] 
 
         chroma_normed = full_chroma / full_chroma.max(axis=0)
