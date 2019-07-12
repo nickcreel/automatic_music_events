@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (QMainWindow, QApplication, QCheckBox, QComboBox,
         QGraphicsLineItem,
         QGraphicsScene, QGraphicsView, QStyle, QWidget, QLabel, QHBoxLayout,
         QMenuBar, QTextEdit, QGridLayout, QAction, QActionGroup, QToolBar,
-        QToolBox, QToolButton)
+        QToolBox, QToolButton, QInputDialog, QFileDialog)
 from PyQt5.QtCore import (QObject, pyqtSignal, QTimer, Qt, pyqtSlot, QThread,
                             QPointF, QRectF, QLineF, QRect)
 from PyQt5.QtGui import (QPen, QTransform)
@@ -33,12 +33,12 @@ from music21 import *
 import xml.etree.ElementTree as ET
 #audio -> chroma information and display plots of chromagrams
 ###############################################
+import queue #threadsafe queue
+import sys
+import socket
+################################################
 import matplotlib
 matplotlib.use("Qt5Agg")# displaying matplotlib plots in Qt
-import queue #threadsafe queue
-################################################
-import sys
-################################################
 from matplotlib.backends.backend_qt5agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
@@ -47,7 +47,6 @@ from math import log2
 ## globals #####################################
 RATE = 22050
 CHUNK = 2048
-
 ## threads #####################################
 ################################################
 
@@ -58,7 +57,7 @@ def freq2MIDI(frequency):
     to that frequency.
     '''
     midinum = 69 + (12 *(log2(frequency / 440)))
-    retrun midinum
+    return midinum
 
 def MIDI2Freq(midinum):
     '''converts midi number to corresponding frequency in hz'''
@@ -125,19 +124,21 @@ class Chromatizer(QObject):
 
     @pyqtSlot(object)
     def calculate(self, frame):
+        print("calculating chroma...")
+        i = 0
         y = frame
         sr = self.rate
         chroma = feature.chroma_cqt(y, sr,
                                         bins_per_octave = 12*3)
+        #filtering reduces volume of noise/partials
         chroma_filtered = np.minimum(chroma,
                                         decompose.nn_filter(chroma,
                                         aggregate = np.median,
                                         metric = 'cosine'))
         chroma_smooth = ndimage.median_filter(chroma_filtered,
                                                 size = (1,9))
-        self.outputqueue.put(chroma_smooth)
-        print(np.argmax(np.mean(chroma_smooth,axis=1)))
-
+        self.outputqueue.put_nowait(chroma_smooth)
+        self.signalToOnlineDTW.emit()
 
 class OnlineDTW(QObject):
 
@@ -145,121 +146,198 @@ class OnlineDTW(QObject):
 
         QObject.__init__(self)
     #### parameters ###############################
-        self.search_band_size = 200
+        self.search_band_size = 512
         self.diagonalWeight = 0.9
         self.maxRunCount = 3
     ##############################################
         self.scoreChroma = score_chroma
         self.framenumscore = len(self.scoreChroma[0])
-        self.framenumaudio = framenumscore
+        print(self.framenumscore)
+        self.framenumaudio = self.framenumscore
         self.pathLenMax = self.framenumscore + self.framenumaudio
         self.audioChroma = np.empty_like(self.scoreChroma)
-        self.chromaBuffer = np.zeros(12, self.search_band_size)
         self.inputQueue = inputqueue
     ###############################################
     #### distance matrices ########################
-        self.globalCostMatrix = None
-        self.localCostMatrix = None
+        self.globalCostMatrix = np.matrix(np.ones((self.framenumscore,
+                                                    self.framenumaudio))
+                                                        * np.inf)
+        self.localCostMatrix = np.matrix(np.ones((self.framenumscore,
+                                                    self.framenumaudio))
+                                                        * np.inf)
     ###############################################
     #### least cost path ##########################
-        self.pathFront = None
-        self.pathOnline = None
-
+        self.pathOnlineIndex = 0
+        self.pathFront = np.zeros((self.pathLenMax, 2))
+        self.pathOnline = np.zeros((self.pathLenMax, 2))
+        self.pathFront[0,:]= [1,1]
+        self.frameQueue = queue.Queue()
+        self.inputindex = 1
+        self.scoreindex = 1
+        self.fnum = 0
+        self.previous = None
 
     @pyqtSlot(object)
     def align(self):
         '''
-        OnlineDTW.align(): finds the best alignment between two chromagrams
-        and returns the position of the best alignment in the global cost
-        matrix. see dixon 2005 online dtw for algorithm details.
-        also received much help from Bochen Li and his reference version in Mat-
-        lab.
+        OnlineDTW.align(): using a modified version of the dynamic time warping
+        algorithm, finds a path of best alignment between two sequences, one
+        known and one partially known. As frames of the partially known sequence
+        are fed into the function, the "cost" or difference between both
+        sequences is calculated, and the algorithm decides which point is
+        the optimal next point in the least cost path by choosing the point with
+        the least cost. Cost is cumulative and the cost of the current point
+        depends on the cost of previous points. previous points also determine
+        the direction that the algorithm predicts the next least cost point will
+        be.
+
+        TODO: needs to emit current alignment point to a OSC signal generator
+        so that signals can be sent to QLab based on current alignment point.
         '''
-
-        previous = None
-        inputindex = 1
-        scoreindex = 1
-        fnum = 0
+        #!!!!!!!!!!!please read!!!!!!!!!!!!!!!!!!!!
+        #note: dixon's description of the algorithm has the input index as the
+        #row index of the cost matrix and the score index as the column index. i
+        #prefer to think of the score index as the y axis, so i use the score
+        #index as the row index of the cost matrix and the input index as the
+        #columnwise index.
+        #
+        #or:
+        #self.globalCostMatrix[scoreindex][inputindex] == proper way to index
+        #cost matrix, as i've written it.
+        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        # t:=1, j:=1
         frameStart = 1
-        runcount = 0
+        runCount = 0
         needNewFrame = 1
-        frameQueue = queue.Queue()
-
+        pathcostindex = 0
         #according to the boundary rules of dtw, both sequences must start and
         #end in the same place...or, more specifically
         #first point in least cost path = (1,1)
         #last point in least cost path = (last point in original,
         #                                      last point in recorded)
-
-
-        self.globalCostMatrix = np.matrix(np.ones((framenumscore, framenumaudio))
-                                                        * np.inf)
-        self.localCostMatrix = np.matrix(np.ones((framenumscore, framenumaudio))
-                                                        * np.inf)
-
-        while scoreindex < self.framenumscore and fnum < self.framenumaudio:
+        if self.scoreindex < self.framenumscore and self.fnum < self.framenumaudio:
+            ## getting next frame ##
             if needNewFrame == 1:
-                fnum = fnum + 1
                 inputData = self.inputQueue.get_nowait()
-                self.chromaBuffer[:,0:-2] = self.chromaBuffer[:,1:-1]
-                self.chromaBuffer[:,-1] = inputData
-                if fnum == 1:
-                    self.audioChroma[:,0] = self.chromaBuffer[:,0]
-                    self.localCostMatrix[0][0] = sum((self.scoreChroma[:,0]-
-                                                      self.audioChroma[:,0])**2)
-                    self.globalCostMatrix[0][0] = self.localCostMatrix[0][0]
-                    self.chromaBuffer[:,0:-2] = self.chromaBuffer[:,1:-1]
+                for i in range(len(inputData[0])):
+                    self.frameQueue.put_nowait(inputData[:,i])# INPUT u(t) (step 3)
+                 # but also step 7
+                ## base case for recursion
+                if self.fnum == 0:
+                    self.fnum = self.fnum + 1
+                    # EvaluatePathCost(t, j) (step 4)
+                    self.audioChroma[:,0] = self.frameQueue.get_nowait()
+                    self.localCostMatrix[0,0] = sum(self.scoreChroma[:,0]-
+                                                      self.audioChroma[:,0])**2
+                    self.globalCostMatrix[0,0] = self.localCostMatrix[0,0]
                 else:
-                    self.audioChroma[:,inputindex] = inputData
+                    self.audioChroma[:,self.inputindex] = self.frameQueue.get_nowait()
             needNewFrame = 0
-
-            direction, x, y = self._getInc(inputindex, scoreindex, previous)
-
-
-
-
-
-
-
-
-
-
-
-
-        pathCost = self._evaluatePathCost(inputindex, scoreindex)
-
-        direction, x, y = self._getInc(inputindex, scoreindex)
-
-
-
-    def _getInc(self, inputindex, scoreindex):
-    '''
-    _getInc: takes input index, score index as arguments and returns a
-    char where:
-    B = both
-    C = column
-    R = row
-    which indicates the direction of the algorithm's calculation.'''
-        if inputIndex < frameSize:
-            return "B"
-        if runCount > self.maxRunCount:
-            if previous == "R":
-                return "C"
-            else:
-                return "R"
-        x, y = np.argmin
-
-    def _evaluatePathCost(self, inputindex, scoreindex):
+            direction = self._getInc(self.scoreindex, self.inputindex,
+                                        self.previous, runCount)
+            # LOOP
+            print(f"fnum is {self.fnum}")
+            print(f"Direction is {direction}")
+            print(f"Previous is {previous}")
+            print(f"scoreindex is {self.scoreindex}")
+            print(f"inputindex is {self.inputindex}")
+            if direction != "C": # step 5
+                self.inputindex += 1  # step 6
+                needNewFrame = 1 # where is step 7 happening?
+                for k in range((self.scoreindex - (self.search_band_size + 1)),
+                                    self.scoreindex): # step 8
+                    if k > 0: # step 9
+                        pathCost = self._evaluatePathCost(k, self.inputindex)
+                        self.globalCostMatrix[k,self.inputindex] = pathCost #step 10
+            if direction != "R": #step 11
+                self.scoreindex += 1 #step 12
+                for k in range((self.inputindex -(self.search_band_size + 1)),
+                                    self.inputindex): #step 13
+                    if k > 0: #step 14
+                        pathCost = self._evaluatePathCost(self.scoreindex, k)
+                        self.globalCostMatrix[self.scoreindex,k] = pathCost #step 15
+            if direction == previous: #step 16
+                runCount += 1 #step 17
+            else: #step 18
+                runCount = 1 #step 19
+            if direction != "B": #step 20
+                previous = self._getInc(self.scoreindex, self.inputindex,
+                                        previous, runCount) #step 21
+            # end loop
+##get direction ##################################
+##################################################
+    def _getInc(self, scoreindex, inputindex, previous, runCount):
         '''
+        _getInc: takes input index, score index as arguments and returns a
+        char where:
+        B = both
+        C = column
+        R = row
+        which indicates the direction of the next alignment point
+        '''
+        print("in _getInc")
+        if inputindex < self.search_band_size: #step 1
+            return "B" #step 2
+        if runCount > self.maxRunCount: #step 3
+            if previous == "R": #step 4
+                return "C" #step 5
+            else: #step 6
+                return "R" #step 7
+        scoreindex_min = None
+        inputindex_min = None
+        #####################################
+        ## need to find the minimum cost given our current scoreindex
+        ## and input index. need to find argmin where either scoreindex
+        ## and inputindex are static, and the other varies up to the current
+        ## index.
+        #####################################
+        ## step 8 ####
+        for i in range(0, scoreindex):
+            inputindex_min = np.argmin(self.globalCostMatrix[i,inputindex])
+        for i in range(0, inputindex):
+            scoreindex_min = np.argmin(self.globalCostMatrix[scoreindex,i])
+        if (self.globalCostMatrix[scoreindex_min[0],scoreindex_min[1]] <
+            self.globalCostMatrix[inputindex_min[0],inputindex_min[1]]):
+            x, y = scoreindex_min[0], scoreindex_min[1]
+        else:
+            x, y = inputindex_min[0], inputindex_min[1]
+        ## end step 8 ####
+        self.pathOnlineIndex +=1
+        self.pathOnline[self.pathOnlineIndex,:] = [x, y]
+        self.pathFront[self.pathOnlineIndex,:] = [scoreindex, inputindex]
+        print(f"Current alignment point is {self.pathOnline[self.pathOnlineIndex,:]}")
+        print(f"current path front is {self.pathFront[self.pathOnlineIndex,:]}")
+        if x < scoreindex: #step 9
+            return "R" #step 10
+        elif y < inputindex: #step 11
+            return "C" #step 12
+        else: #step 13
+            return "B" #step 14
+
+    def _evaluatePathCost(self, scoreindex, inputindex):
+        '''
+        OnlineDTW._evaluatePathCost:
         calculates the cost difference between the current
-        frames of the score and audio chromagrams, returns pathCost
+        frames of the score and audio chromagrams, returns pathCost.
         cost is weighted so that there is no bias towards the diagonal
         (see dixon 2005)
+        cost of cell is based on cost of previous cells in the vertical,
+        horizonal, or diagonal direction backward, hence /dynamic/ time warping.
         '''
-        pathCost = sum((self.scoreChroma[:,scoreindex]-
-                        self.audioChroma[:,inputindex])**2)
-        return pathCost
+        print("in _evaluatePathCost")
+        dist = np.linalg.norm(self.scoreChroma[:,scoreindex] -
+                                self.audioChroma[:,inputindex])
+        print(f"dist is {dist}")
+        pathCost = min(((self.globalCostMatrix[scoreindex,inputindex-1] +
+                        dist),
 
+                       (self.globalCostMatrix[scoreindex - 1,inputindex]+
+                        dist),
+                        #diagonal
+                       (self.globalCostMatrix[scoreindex-1,inputindex-1]+
+                            (self.diagonalWeight*dist))))
+        print(f"pathCost is {pathCost}")
+        return pathCost
 
 class Reader(QObject):
     signalToChromatizer = pyqtSignal(object)
@@ -277,6 +355,27 @@ class Reader(QObject):
             frame = None
         if frame is not None:
             self.signalToChromatizer.emit(frame)
+'''
+class OSCHandler(QObject):
+#see https://nerdclub-uk.blogspot.com/2016/09/
+#osc-udp-tcpip-and-choosing-right.html
+    def __init__(self, cues, serverPort = 53000, clientPort = 53000, serverIP = 'localhost'):
+
+        self.cues = cues
+        self.serverPort = serverPort
+        self.clientPort = clientPort
+        self.serverIP = serverIP
+
+    def setupClient(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_address = (self.serverIP, self.serverPort)
+        sock.connect(server_address)
+
+    @pyqtSlot(object)
+    def sendOSC(self):
+        try:
+            for
+'''
 
 class MusicXMLprocessor:
     '''
@@ -390,7 +489,7 @@ class MusicXMLprocessor:
                     end = note.seconds + start
                     if parts_and_voices[i].partName != "GO":
                         chroma_node = (note.name, start, end)
-                        chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node
+                        chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node)
                     else:
                         if note.name is not "rest":
                             trigger_node = (note.lyric, start, end)
@@ -403,7 +502,7 @@ class MusicXMLprocessor:
                     end = note.seconds + start
                     if parts_and_voices[i].partName != "GO":
                         chroma_node = (note.name, start, end)
-                        chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node
+                        chroma_nodes_per_part[parts_and_voices[i].partName].append(chroma_node)
                     else:
                         if note.name is not "rest":
                             trigger_node = (note.lyric, start, end)
@@ -433,7 +532,7 @@ class MusicXMLprocessor:
         seen_triggers = []
         for part in chroma_nodes_per_part:
             print("part:", part)
-            if part not "GO":
+            if part != "GO":
                     chroma_vector_per_part[part] = [[],
                                                     [],
                                                     [],
@@ -461,7 +560,7 @@ class MusicXMLprocessor:
                                 notes_in_frame.append("R")
                         else:
                             if node[0] != 'rest' and node[0] not in seen_triggers:
-                                self.eventTriggerOnset((i, node[0])
+                                self.eventTriggerOnset((i, node[0]))
                                 seen_triggers.append(node[0])
 
                     elif node[1] < i and i<= node[2] and type(node[0]) == list:
@@ -501,7 +600,7 @@ class MusicXMLprocessor:
         #any values that are nan are 0/0, which means they should be 0
         #anyway. a row that sums to 0 means silence, which we should preserve.
         self.chroma = chroma_normed
-        return self.chroma, self.eventTriggerOnset
+        return self.chroma
 
 #####################################################
 ## Qt app instantiation -> thread setup
@@ -515,6 +614,8 @@ class App(QMainWindow):
         self.title = "Realtime Chroma Extraction"
         self.width = 640
         self.height = 400
+        self.initUI()
+        ## non-UI stuff
         self.setupThreads()
         self.signalsandSlots()
         self.timer = QTimer()
@@ -522,22 +623,42 @@ class App(QMainWindow):
         self.timer.setSingleShot(True)
         self.timer.start(10000)
 
+    def initUI(self):
+        self.setWindowTitle(self.title)
+        self.setGeometry(self.left, self.top, self.width, self.height)
+        self.show()
+
     def setupThreads(self):
+        ## score chroma calculations
+        # for testing ###
+        file = "/Users/hypatia/Twinkle_Twinkle_Little_Star.musicxml"
+        self.scorechroma = MusicXMLprocessor(file)
+        self.scorechroma.musicXMLtoChroma()
+        #################
+        ## queues
         self.readQueue = queue.Queue()
         self.chromaQueue = queue.Queue()
+        ## threads
         self.audioThread = QThread()
-        self.audioRecorder = AudioRecorder(self.readQueue)
-        self.audioRecorder.moveToThread(self.audioThread)
-        self.audioThread.start()
+        self.dtwThread = QThread()
         self.readerThread = QThread()
+        self.chromaThread = QThread()
+        #creating instances of objects and moving to threads
+        self.audioRecorder = AudioRecorder(self.readQueue,
+                                            input_device_index = 2)
+        self.audioRecorder.moveToThread(self.audioThread)
         self.reader = Reader(self.readQueue)
         self.reader.moveToThread(self.readerThread)
-        self.chromaThread = QThread()
         self.chromatizer = Chromatizer(inputqueue = self.readQueue,
                                     outputqueue = self.chromaQueue)
         self.chromatizer.moveToThread(self.chromaThread)
+        self.onlineDTW = OnlineDTW(self.scorechroma.chroma, self.chromaQueue)
+        self.onlineDTW.moveToThread(self.dtwThread)
+        ## starting threads
+        self.audioThread.start()
         self.readerThread.start()
         self.chromaThread.start()
+        self.dtwThread.start()
 
     def closeEvent2(self):
         self.audioRecorder.stopStream()
@@ -545,19 +666,18 @@ class App(QMainWindow):
 
     def signalsandSlots(self):
         self.reader.signalToChromatizer.connect(self.chromatizer.calculate)
+        self.chromatizer.signalToOnlineDTW.connect(self.onlineDTW.align)
+
+    def openFilesDialogue(self):
+        options = QFileDialog.Options()
+        options |= QFileDialog.DontUseNativeDialog
+        files, _ = QFileDialog.getOpenFileNames(self, "Load your MusicXML file"
+                            "", "MusicXML Files (*.musicxml, *.mxl, *.xml)",
+                            options = options)
 
 ## currently just testing but u know...will be other things soon.
 if __name__ == "__main__":
-    musicxmlparser = MusicXMLprocessor("/Users/hypatia/Qt_projects/wtq.xml")
-    chroma, events = musicxmlparser.musicXMLtoChroma()
-    print(chroma[-11:-1])
-    display.specshow(chroma,
-                     x_axis = "time",
-                     y_axis = "chroma",
-                     cmap = "viridis")
-    plt.show()
     app = QApplication(sys.argv)
     mainwindow = App()
-    mainwindow.show()
     exit_code = app.exec_()
     sys.exit(exit_code)
