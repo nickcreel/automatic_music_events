@@ -42,7 +42,7 @@ matplotlib.use("Qt5Agg")# displaying matplotlib plots in Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
-from math import log2
+from math import log2, sqrt
 ################################################
 ## globals #####################################
 RATE = 22050
@@ -72,7 +72,7 @@ class AudioRecorder(QObject):
     '''
 
     def __init__(self, queue,  rate = RATE, chunk = CHUNK,
-                                            input_device_index=0):
+                                            input_device_index=2):
         #rate = librosa default
         QObject.__init__(self) #getting all the qthread stuff
         self.rate = rate
@@ -112,7 +112,7 @@ class Chromatizer(QObject):
     reference chroma. Currently prints value of fundamental frequency
     of audio chunk.
     '''
-    signalToOnlineDTW = pyqtSignal(object)
+    signalToOnlineDTW = pyqtSignal()
     def __init__(self, inputqueue, outputqueue):
         QObject.__init__(self)
         self.outputqueue = outputqueue
@@ -176,8 +176,10 @@ class OnlineDTW(QObject):
         self.scoreindex = 1
         self.fnum = 0
         self.previous = None
+        self.needNewFrame = 1
+        self.runCount = 0
 
-    @pyqtSlot(object)
+    @pyqtSlot()
     def align(self):
         '''
         OnlineDTW.align(): using a modified version of the dynamic time warping
@@ -205,21 +207,12 @@ class OnlineDTW(QObject):
         #self.globalCostMatrix[scoreindex][inputindex] == proper way to index
         #cost matrix, as i've written it.
         #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-        # t:=1, j:=1
-        frameStart = 1
-        runCount = 0
-        needNewFrame = 1
-        pathcostindex = 0
-        #according to the boundary rules of dtw, both sequences must start and
-        #end in the same place...or, more specifically
-        #first point in least cost path = (1,1)
-        #last point in least cost path = (last point in original,
-        #                                      last point in recorded)
         if self.scoreindex < self.framenumscore and self.fnum < self.framenumaudio:
             ## getting next frame ##
-            if needNewFrame == 1:
+            if self.needNewFrame == 1 and not self.inputQueue.empty():
                 inputData = self.inputQueue.get_nowait()
                 for i in range(len(inputData[0])):
+                    print(inputData[:,i])
                     self.frameQueue.put_nowait(inputData[:,i])# INPUT u(t) (step 3)
                  # but also step 7
                 ## base case for recursion
@@ -227,42 +220,49 @@ class OnlineDTW(QObject):
                     self.fnum = self.fnum + 1
                     # EvaluatePathCost(t, j) (step 4)
                     self.audioChroma[:,0] = self.frameQueue.get_nowait()
-                    self.localCostMatrix[0,0] = sum(self.scoreChroma[:,0]-
-                                                      self.audioChroma[:,0])**2
+                    costtemp = 0
+                    for i in range(len(self.scoreChroma[:,0])):
+                        diff = self.scoreChroma[:,0][i]-self.audioChroma[:,0][i]
+                        diff = diff**2
+                        costtemp += sqrt(diff)
+                    self.localCostMatrix[0,0] = costtemp
                     self.globalCostMatrix[0,0] = self.localCostMatrix[0,0]
                 else:
+                    self.fnum +=1
                     self.audioChroma[:,self.inputindex] = self.frameQueue.get_nowait()
-            needNewFrame = 0
+            self.needNewFrame = 0
             direction = self._getInc(self.scoreindex, self.inputindex,
-                                        self.previous, runCount)
+                                        self.previous, self.runCount)
             # LOOP
             print(f"fnum is {self.fnum}")
             print(f"Direction is {direction}")
-            print(f"Previous is {previous}")
+            print(f"Previous is {self.previous}")
             print(f"scoreindex is {self.scoreindex}")
             print(f"inputindex is {self.inputindex}")
             if direction != "C": # step 5
-                self.inputindex += 1  # step 6
-                needNewFrame = 1 # where is step 7 happening?
+                 # step 6
+                self.needNewFrame = 1 # where is step 7 happening?
                 for k in range((self.scoreindex - (self.search_band_size + 1)),
                                     self.scoreindex): # step 8
                     if k > 0: # step 9
                         pathCost = self._evaluatePathCost(k, self.inputindex)
-                        self.globalCostMatrix[k,self.inputindex] = pathCost #step 10
+                        self.globalCostMatrix[k,self.inputindex] = pathCost
+                self.inputindex += 1  #step 10
             if direction != "R": #step 11
-                self.scoreindex += 1 #step 12
+                #step 12
                 for k in range((self.inputindex -(self.search_band_size + 1)),
                                     self.inputindex): #step 13
                     if k > 0: #step 14
                         pathCost = self._evaluatePathCost(self.scoreindex, k)
-                        self.globalCostMatrix[self.scoreindex,k] = pathCost #step 15
-            if direction == previous: #step 16
-                runCount += 1 #step 17
+                        self.globalCostMatrix[self.scoreindex,k] = pathCost
+                self.scoreindex += 1  #step 15
+            if direction == self.previous: #step 16
+                self.runCount += 1 #step 17
             else: #step 18
-                runCount = 1 #step 19
+                self.runCount = 1 #step 19
             if direction != "B": #step 20
-                previous = self._getInc(self.scoreindex, self.inputindex,
-                                        previous, runCount) #step 21
+                self.previous = self._getInc(self.scoreindex, self.inputindex,
+                                        self.previous, self.runCount) #step 21
             # end loop
 ##get direction ##################################
 ##################################################
@@ -325,10 +325,22 @@ class OnlineDTW(QObject):
         horizonal, or diagonal direction backward, hence /dynamic/ time warping.
         '''
         print("in _evaluatePathCost")
-        dist = np.linalg.norm(self.scoreChroma[:,scoreindex] -
-                                self.audioChroma[:,inputindex])
+        print(f'score chroma is {self.scoreChroma[:,scoreindex]}')
+        print(f'audio chroma is{self.audioChroma[:,inputindex]}')
+        dist = 0
+        for i in range(len(self.scoreChroma[:,scoreindex])):
+            diff = self.scoreChroma[:,scoreindex][i]-self.audioChroma[:,inputindex][i]
+            diff = diff**2
+            dist += sqrt(diff)
         print(f"dist is {dist}")
-        pathCost = min(((self.globalCostMatrix[scoreindex,inputindex-1] +
+        print(scoreindex,' ' ,inputindex)
+        print(self.globalCostMatrix[scoreindex,inputindex-1] +
+                        dist)
+        print(self.globalCostMatrix[scoreindex - 1,inputindex]+
+         dist)
+        print(self.globalCostMatrix[scoreindex-1,inputindex-1]+
+             (self.diagonalWeight*dist))
+        pathCost = np.min(((self.globalCostMatrix[scoreindex,inputindex-1] +
                         dist),
 
                        (self.globalCostMatrix[scoreindex - 1,inputindex]+
@@ -644,8 +656,7 @@ class App(QMainWindow):
         self.readerThread = QThread()
         self.chromaThread = QThread()
         #creating instances of objects and moving to threads
-        self.audioRecorder = AudioRecorder(self.readQueue,
-                                            input_device_index = 2)
+        self.audioRecorder = AudioRecorder(self.readQueue)
         self.audioRecorder.moveToThread(self.audioThread)
         self.reader = Reader(self.readQueue)
         self.reader.moveToThread(self.readerThread)
