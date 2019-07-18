@@ -24,6 +24,7 @@ from PyQt5.QtCore import (QObject, pyqtSignal, QTimer, Qt, pyqtSlot, QThread,
                             QPointF, QRectF, QLineF, QRect)
 from PyQt5.QtGui import (QPen, QTransform)
 from PyQt5.QtSvg import QGraphicsSvgItem
+import pyqtgraph as pg
 ##############################################
 import pyaudio #audio streams
 import numpy as np
@@ -37,17 +38,10 @@ import queue #threadsafe queue
 import sys
 import socket
 import wave
-import time
-################################################
-import matplotlib
-matplotlib.use("Qt5Agg")# displaying matplotlib plots in Qt
-from matplotlib.backends.backend_qt5agg import FigureCanvasAgg as FigureCanvas
-from matplotlib.figure import Figure
-import matplotlib.pyplot as plt
 from math import log2, sqrt
 ################################################
 ## globals #####################################
-RATE = 22050
+RATE = 44100
 CHUNK = 4096
 ## threads #####################################
 ################################################
@@ -64,16 +58,18 @@ class AudioRecorder(QObject):
         #rate = librosa default
         QObject.__init__(self) #getting all the qthread stuff
         self.rate = rate
+        self.i=0
         if wavfile != None:
             self.file = wave.open(wavfile, 'r')
             self.filelen = self.file.getnframes()
+            print(self.filelen)
         else:
             self.file = None
         self.chunk = chunk
         self.queue = queue
         self.p = pyaudio.PyAudio()
         self.input_device_index = input_device_index
-        if self.file != None:
+        if self.file == None:
             self.stream = self.p.open(format= pyaudio.paFloat32,
                                     channels = 1,
                                     rate = self.rate,
@@ -82,11 +78,11 @@ class AudioRecorder(QObject):
                                     frames_per_buffer = self.chunk,
                                     stream_callback = self._callback)
         else:
-            self.stream = format = self.p.get_format_from_width(self.file.getsampwidth(),
+            self.stream = self.p.open(format=self.p.get_format_from_width(self.file.getsampwidth()),
                                     channels = self.file.getnchannels(),
-                                    rate = self.file.getframerate(),
+                                    rate = self.rate,
                                     input = True,
-                                    stream_callback = callback)
+                                    stream_callback = self._callback)
         self.stop = False
 
     def stopStream(self):
@@ -101,9 +97,12 @@ class AudioRecorder(QObject):
         put data and rate into queue
         continue
         """
+        self.i+=1
+        print(self.i)
         if self.file != None:
             data = self.file.readframes(frame_count)
             data = np.frombuffer(data, "int16")
+            print(len(data))
         else:
             data = np.frombuffer(in_data, "float32")
         self.queue.put(data)
@@ -154,7 +153,7 @@ class Chromatizer(QObject):
         self.signalToOnlineDTW.emit()
 
 class OnlineDTW(QObject):
-    signalToPlotter = pyqtSignal(object)
+    signalToGUIThread = pyqtSignal(object)
     def __init__(self, score_chroma, inputqueue, cuelist):
 
         QObject.__init__(self)
@@ -240,15 +239,15 @@ class OnlineDTW(QObject):
                     self.fnum +=1
                     self.audioChroma[:,self.inputindex] = self.frameQueue.get_nowait()
                     np.place(self.audioChroma[:,self.inputindex], np.isnan(self.audioChroma[:,self.inputindex]), 0)
-            print(f"audio chroma is {self.audioChroma[:,self.inputindex]}")
-            print(f"score chroma is {self.scoreChroma[:,self.scoreindex]}")
+        #    print(f"audio chroma is {self.audioChroma[:,self.inputindex]}")
+        #    print(f"score chroma is {self.scoreChroma[:,self.scoreindex]}")
 
             self.needNewFrame = 0
             direction = self._getInc(self.scoreindex, self.inputindex,
                                         self.previous, self.runCount)
-            print(f'direction is {direction}')
+        #    print(f'direction is {direction}')
             # LOOP
-            print(f'self.runCount is {self.runCount}')
+        #    print(f'self.runCount is {self.runCount}')
             if direction != "C":
                 for k in range((self.inputindex -(self.search_band_size + 1)),
                                         self.inputindex):
@@ -293,11 +292,8 @@ class OnlineDTW(QObject):
             else:
                 return "R"
 
-        path1 = self.globalPathCost[scoreindex-1, :-inputindex]
-        path2 = self.globalPathCost[:-scoreindex, inputindex-1]
-
-        #print(f'path1 is {path1}')
-        #print(f'path2 is {path2}')
+        path1 = self.globalPathCost[scoreindex-1, 0:inputindex]
+        path2 = self.globalPathCost[0:scoreindex, inputindex-1]
 
         for i in range(len(path1)):
             path1[i] = path1[i] / sqrt((scoreindex-1)**2+i**2)
@@ -306,28 +302,31 @@ class OnlineDTW(QObject):
             path2[i] = path2[i] / sqrt((inputindex-1)**2 + i **2)
             path2[i] = path2[i] / (inputindex-1 + i)
 
-        print(f'path1 is {path1}')
-        print(f'path2 is {path2}')
-
         minOfPath1, y = np.min(path1), np.argmin(path1)
         minOfPath2, x = np.min(path2), np.argmin(path2)
 
+        print(f'x before if is {x}')
+        print(f'y before if is {y}')
+
         if minOfPath1 < minOfPath2:
-            print("minOfPath1 < minOfPath2")
             x = scoreindex-1
         elif minOfPath1 > minOfPath2:
-            print("minOfPath2 < minOfPath1")
             y = inputindex-1
         else:
-
             y = inputindex-1
             x = scoreindex-1
+        print(f'x after if is {x}')
+        print(f'y after if is {y}')
+
         self.pathOnlineIndex +=1
         self.pathOnline[self.pathOnlineIndex,:] = [x, y]
         self.pathFront[self.pathOnlineIndex,:] = [scoreindex-1, inputindex-1]
-        print(f"current alignment point is ({x}, {y})")
+        print(f"current alignment point is ({x}, {y}")
+
+        self.signalToGUIThread.emit(self.pathOnline)
+
         for cue in self.cuelist:
-            if x == cue[0]:
+            if scoreindex-1 == cue[0]:
                 print(f"CUE HIT: CUE NUMBER {cue[1]}" +
                 f"SCORE INDEX {self.scoreindex-1}")
 
@@ -627,9 +626,6 @@ class App(QMainWindow):
 
         ## non-UI stuff
         self.setupThreads()
-        #self.initUI()
-        #self.centralWidget = QWidget()
-        #self.setCentralWidget(self.centralWidget())
         self.signalsandSlots()
         self.timer = QTimer()
         self.timer.timeout.connect(self.closeEvent2)
@@ -637,15 +633,11 @@ class App(QMainWindow):
         self.timer.start(2000000)
 
     def setupThreads(self):
-        ## score chroma calculations
-        # for testing ###
         file = "/Users/hypatia/Twinkle_with_Cues.musicxml"
         self.scorechroma = MusicXMLprocessor(file)
         self.scorechroma.musicXMLtoChroma()
         cues = self.scorechroma.eventTriggerOnset
-        #print(f'cues = {cues}')
-        #################
-        ## queues
+
         self.readQueue = queue.Queue()
         self.chromaQueue = queue.Queue()
         ## threads
@@ -653,8 +645,7 @@ class App(QMainWindow):
         self.dtwThread = QThread()
         self.readerThread = QThread()
         self.chromaThread = QThread()
-        #self.plotterThread = QThread()
-        #creating instances of objects and moving to threads
+
         self.audioRecorder = AudioRecorder(self.readQueue, wavfile = "/Users/hypatia/Twinkle_with_Cues.wav")
         self.audioRecorder.moveToThread(self.audioThread)
         self.reader = Reader(self.readQueue)
@@ -664,14 +655,12 @@ class App(QMainWindow):
         self.chromatizer.moveToThread(self.chromaThread)
         self.onlineDTW = OnlineDTW(self.scorechroma.chroma, self.chromaQueue, cues)
         self.onlineDTW.moveToThread(self.dtwThread)
-        #self.plotter = Plotter(self)
-        #self.plotter.moveToThread(self.plotterThread)
-        ## starting threads
+
         self.audioThread.start()
         self.readerThread.start()
         self.chromaThread.start()
         self.dtwThread.start()
-        #self.plotterThread.start()
+
 
     def closeEvent2(self):
         self.audioRecorder.stopStream()
@@ -680,16 +669,25 @@ class App(QMainWindow):
     def signalsandSlots(self):
         self.reader.signalToChromatizer.connect(self.chromatizer.calculate)
         self.chromatizer.signalToOnlineDTW.connect(self.onlineDTW.align)
+        self.onlineDTW.signalToGUIThread.connect(self.plotter)
         #self.onlineDTW.signalToPlotter.connect(self.plotter.animate)
 
-    def openFilesDialogue(self):
-        options = QFileDialog.Options()
-        options |= QFileDialog.DontUseNativeDialog
-        files, _ = QFileDialog.getOpenFileNames(self, "Load your MusicXML file"
-                            "", "MusicXML Files (*.musicxml, *.mxl, *.xml)",
-                            options = options)
+    @pyqtSlot(object)
+    def plotter(self, line):
+        init = 0
+        line = line
+        self.x = [line[i, 1] for i in range(len(line))]
+        self.y = [line[i, 0] for i in range(len(line))]
+        self.y_axis_size = len(self.scorechroma.chroma[0])
+        self.x_axis_size = self.y_axis_size #we don't know the actual size
+        if init == 0:
+            self.plt = pg.plot(self.x, self.y, pen="b", symbol='o', title="Alignment Path")
+            self.plt.showGrid(x=True, y=True)
+            init = 1
+        else:
+            self.plt.PlotDataItem(self.x, self.y, clear = True)
 
-## currently just testing but u know...will be other things soon.
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     mainwindow = App()
