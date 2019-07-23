@@ -26,7 +26,9 @@ from PyQt5.QtGui import (QPen, QTransform)
 from PyQt5.QtSvg import QGraphicsSvgItem
 import pyqtgraph as pg
 ##############################################
-import pyaudio #audio streams
+import pyaudio #audio
+import asyncio
+from pythonosc import udp_client, osc_message_builder
 import numpy as np
 from scipy import ndimage
 from librosa import feature, display, decompose
@@ -40,6 +42,8 @@ import socket
 import wave
 from math import log2, sqrt
 ################################################
+#import AudioRecorder, Chromatizer, OnlineDTW, MusicXMLprocessor
+################################################
 ## globals #####################################
 RATE = 44100
 CHUNK = 4096
@@ -52,7 +56,7 @@ class AudioRecorder(QObject):
     audio input device (default is 0) in chunks, then pushes audio to
     queue for processing by Chromatizer thread.
     '''
-
+    signalToChromatizer = pyqtSignal(object)
     def __init__(self, queue, wavfile=None, rate = RATE, chunk = CHUNK,
                        input_device_index = 0):
         #rate = librosa default
@@ -65,7 +69,7 @@ class AudioRecorder(QObject):
         if wavfile != None:
             self.file = wave.open(wavfile, 'r')
             self.filelen = self.file.getnframes()
-            print(self.filelen)
+            #print(self.filelen)
         else:
             self.file = None
         self.chunk = chunk
@@ -105,21 +109,18 @@ class AudioRecorder(QObject):
         """
 
         data = self.file.readframes(frame_count)
-        # self.stream.write(data)
+        #self.stream.write(data)
         if self.file != None:
             if data != '':
                 data = np.frombuffer(data, "int16")
                 data_per_channel=[data[chan::self.file.getnchannels()] for chan in range(self.file.getnchannels())]
                 mono = (data_per_channel[0] + data_per_channel[1])/2
-
-                self.queue.put(mono)
-                print(f'i is {self.i}')
+                self.signalToChromatizer.emit(mono)
+                #print(f'i is {self.i}')
                 self.i += 1
-            else:
-                print("no data")
         else:
             data = np.frombuffer(in_data, "float32")
-            self.queue.put(data)
+            self.signalToChromatizer.emit(data)
         return (data, pyaudio.paContinue)
 
 
@@ -166,7 +167,8 @@ class Chromatizer(QObject):
         self.signalToOnlineDTW.emit()
 
 class OnlineDTW(QObject):
-    signalToGUIThread = pyqtSignal(object)
+    signalToGUIThread = pyqtSignal(object, object)
+    signalToOSCclient = pyqtSignal(object)
     def __init__(self, score_chroma, inputqueue, cuelist):
 
         QObject.__init__(self)
@@ -176,7 +178,7 @@ class OnlineDTW(QObject):
     ##############################################
         self.scoreChroma = score_chroma
         self.framenumscore = len(self.scoreChroma[0])
-        print("framenumscore is ", self.framenumscore)
+        #print("framenumscore is ", self.framenumscore)
         #print(self.framenumscore)
         self.framenumaudio = self.framenumscore * 2
         self.pathLenMax = self.framenumscore + self.framenumaudio
@@ -237,28 +239,27 @@ class OnlineDTW(QObject):
         #cost matrix, as i've written it.
         #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         if self.scoreindex < self.framenumscore:
-            print(f'path online index is {self.pathOnlineIndex}')
-            print(f'score index (J) is {self.scoreindex}')
+            #print(f'path online index is {self.pathOnlineIndex}')
+            #print(f'score index (J) is {self.scoreindex}')
 
             if self.needNewFrame == 1 and not self.inputQueue.empty():
                 inputData = self.inputQueue.get_nowait()
-                self.frameQueue.put_nowait(inputData)
                 #print(f'fnum is {self.fnum)
                 if self.fnum == 0:
                     self.fnum = self.fnum + 1
                     #print(f"after {self.audioChroma[:,0]}")
-                    self.audioChroma[:,0] = self.frameQueue.get_nowait() # self.scoreChroma[:,0]
-                    print(f"after {self.audioChroma[:,0]}")
+                    self.audioChroma[:,0] = inputData #
+                    #print(f"after {self.audioChroma[:,0]}")
                     diff = np.linalg.norm(self.scoreChroma[:,0] - self.audioChroma[:,0])
                     #print(diff)
                     self.localEuclideanDistance[0,0]= diff
                     self.globalPathCost[0,0] = self.localEuclideanDistance[0,0]
                 else:
                     self.fnum +=1
-                    self.audioChroma[:,self.inputindex] = self.frameQueue.get_nowait() # self.scoreChroma[:,self.inputindex] #
+                    self.audioChroma[:,self.inputindex] = inputData
                     np.place(self.audioChroma[:,self.inputindex], np.isnan(self.audioChroma[:,self.inputindex]), 0)
-            print(f"audio chroma is {self.audioChroma[:,self.inputindex]}")
-            print(f"score chroma is {self.scoreChroma[:,self.scoreindex]}")
+            #print(f"audio chroma is {self.audioChroma[:,self.inputindex]}")
+            #print(f"score chroma is {self.scoreChroma[:,self.scoreindex]}")
 
             self.needNewFrame = 0
             direction = self._getInc()
@@ -280,12 +281,12 @@ class OnlineDTW(QObject):
                 self.inputindex += 1
 
             test = direction==self.previous
-            print(f"is direction == self.previous? {test}")
+            #print(f"is direction == self.previous? {test}")
             if test == True:
                 self.runCount += 1
             else:
                 self.runCount = 1
-            print(f'self.runCount is {self.runCount}')
+            #print(f'self.runCount is {self.runCount}')
             if direction != "B":
                 self.previous = direction
             # end loop
@@ -344,17 +345,19 @@ class OnlineDTW(QObject):
             y = self.scoreindex-1
         self.pathOnlineIndex +=1
         self.pathOnline[self.pathOnlineIndex,:] = [x, y]
-        print(f"current alignment point is ({x}, {y}")
+        #print(f"current alignment point is ({x}, {y}")
+
+        seencues = []
         for cue in self.cuelist:
-                if self.scoreindex-1 == cue[0]:
-                    print(f"CUE HIT: CUE NUMBER {cue[1]}" +
-                    f"SCORE INDEX {self.scoreindex-1}")
+                if self.scoreindex-1 == cue[0] and cue[1] not in seencues:
+                    self.signalToOSCclient.emit(cue[1])
+                    seencues.append(cue[1])
 
         #self.pathFront[self.pathOnlineIndex,:] = [self.scoreindex-1-1, self.inputindex-1]
         # (i don't know what we need this for? but it was in bochen's code)
 
 
-        self.signalToGUIThread.emit(self.pathOnline)
+        self.signalToGUIThread.emit(self.pathOnline, self.globalPathCost)
 
 
         if self.runCount > self.maxRunCount:
@@ -398,23 +401,6 @@ class OnlineDTW(QObject):
                             (2*diff))))
         #print(f'pathCost is {pathCost}')
         return pathCost
-
-class Reader(QObject):
-    signalToChromatizer = pyqtSignal(object)
-    def __init__(self, queue):
-        QObject.__init__(self)
-        self.queue = queue
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.getter)
-        self.timer.start(50)
-
-    def getter(self):
-        try:
-            frame = self.queue.get_nowait()
-        except:
-            frame = None
-        if frame is not None:
-            self.signalToChromatizer.emit(frame)
 
 class MusicXMLprocessor:
     '''
@@ -644,6 +630,24 @@ class MusicXMLprocessor:
         self.chroma = chroma_normed
         return self.chroma
 
+class OSCclient(QObject):
+    """Connects to OSC server to send OSC messages to server
+    input: ip of qlab machine, input port number
+    default localhost, 53000 (QLab settings)"""
+    def __init__(self, ip="127.0.0.1", port=53000):
+        QObject.__init__(self)
+        self.ip = ip
+        self.port = port
+        self.client = udp_client.UDPClient(ip, port)
+    pyqtSlot(object)
+    def emit(self, cuenum):
+        msg_raw = f"/cue/{cuenum}/start"
+        print(f'{msg_raw} sent')
+        msg = osc_message_builder.OscMessageBuilder(msg_raw)
+        msg = msg.build()
+        self.client.send(msg)
+
+
 #####################################################
 ## Qt app instantiation -> thread setup
 #####################################################
@@ -656,60 +660,71 @@ class App(QMainWindow):
         self.title = "Realtime Chroma Extraction"
         self.width = 640
         self.height = 400
+        pg.setConfigOption("background", "w")
+        pg.setConfigOption("foreground", "k")
+        self.win = pg.GraphicsWindow(title="OnlineDTW")
+        self.p = self.win.addPlot(title = "Minimum Cost Path",
+                                  labels = {
+                                  'bottom':"Audio Frame (U(t))",
+                                  'left':"Score Frame (V(j))"},
+                                   backround = "white")
 
-        self.win = pg.GraphicsWindow(title="DTW")
-        self.p = self.win.addPlot(title = "min cost path")
-        self.curve = self.p.plot(pen="b", symbol = "o")
+        self.curve = self.p.plot(pen="r", background="w")
+        #self.imv = pg.ImageView(parent = self.win)
+        #self.imv.show()
         ## non-UI stuff
         self.setupThreads()
         self.signalsandSlots()
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.closeEvent2)
-        self.timer.setSingleShot(True)
-        self.timer.start(2000000)
+        #self.timer = QTimer()
+        #self.timer.timeout.connect(self.closeEvent2)
+        #self.timer.setSingleShot(True)
+        #self.timer.start(2000000)
 
     def setupThreads(self):
         file = "/Users/hypatia/Twinkle_with_Cues.musicxml"
         self.scorechroma = MusicXMLprocessor(file)
         self.scorechroma.musicXMLtoChroma()
         cues = self.scorechroma.eventTriggerOnset
-
         self.readQueue = queue.Queue()
         self.chromaQueue = queue.Queue()
         ## threads
         self.audioThread = QThread()
         self.dtwThread = QThread()
-        self.readerThread = QThread()
         self.chromaThread = QThread()
+        self.oscthread = QThread()
 
         self.audioRecorder = AudioRecorder(self.readQueue, wavfile = "/Users/hypatia/Twinkle_with_Cues_audio.wav")
         self.audioRecorder.moveToThread(self.audioThread)
-        self.reader = Reader(self.readQueue)
-        self.reader.moveToThread(self.readerThread)
         self.chromatizer = Chromatizer(inputqueue = self.readQueue,
                                     outputqueue = self.chromaQueue)
         self.chromatizer.moveToThread(self.chromaThread)
         self.onlineDTW = OnlineDTW(self.scorechroma.chroma, self.chromaQueue, cues)
         self.onlineDTW.moveToThread(self.dtwThread)
+        self.oscclient = OSCclient(ip = "10.5.0.180")
+        self.oscclient.moveToThread(self.oscthread)
+
 
         self.audioThread.start()
-        self.readerThread.start()
         self.chromaThread.start()
         self.dtwThread.start()
+        self.oscthread.start()
 
 
     def closeEvent2(self):
         self.audioRecorder.stopStream()
-        self.reader.timer.stop()
 
     def signalsandSlots(self):
-        self.reader.signalToChromatizer.connect(self.chromatizer.calculate)
+        self.audioRecorder.signalToChromatizer.connect(self.chromatizer.calculate)
         self.chromatizer.signalToOnlineDTW.connect(self.onlineDTW.align)
         self.onlineDTW.signalToGUIThread.connect(self.plotter)
+        self.onlineDTW.signalToOSCclient.connect(self.oscclient.emit)
         #self.onlineDTW.signalToPlotter.connect(self.plotter.animate)
 
-    @pyqtSlot(object)
-    def plotter(self, line):
+    @pyqtSlot(object, object)
+    def plotter(self, line, matrix):
+        line.sort(axis = 0)
+        np.place(matrix, np.isinf(matrix),500)
+        #self.imv.setImage(matrix)
         self.curve.setData(line)
         # init = 0
         # line = line
