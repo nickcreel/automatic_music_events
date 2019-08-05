@@ -5,7 +5,7 @@ import queue
 from math import sqrt
 
 class OnlineDTW(QObject):
-    signalToGUIThread = pyqtSignal(object, object)
+    signalToGUIThread = pyqtSignal(object)
     signalToOSCclient = pyqtSignal(object)
     def __init__(self, score_chroma, inputqueue, cuelist):
 
@@ -16,6 +16,8 @@ class OnlineDTW(QObject):
     ##############################################
         self.scoreChroma = score_chroma
         self.framenumscore = len(self.scoreChroma[0])
+        #print("framenumscore is ", self.framenumscore)
+        #print(self.framenumscore)
         self.framenumaudio = self.framenumscore * 2
         self.pathLenMax = self.framenumscore + self.framenumaudio
         self.audioChroma = np.zeros((12, self.framenumaudio))
@@ -25,13 +27,18 @@ class OnlineDTW(QObject):
         self.globalPathCost = np.matrix(np.ones((self.framenumscore,
                                                     self.framenumaudio))
                                                         * np.inf)
+        #this is a matrix of the cost of a path which terminates at point [x, y]
+        #print(self.globalPathCost)
         self.localEuclideanDistance = np.matrix(np.ones((self.framenumscore,
                                                     self.framenumaudio))
                                                         * np.inf)
+        #this is a matrix of the euclidean distance between frames of audio
     ###############################################
     #### least cost path ##########################
         self.pathOnlineIndex = 0
+        #self.pathFront = np.zeros((self.pathLenMax, 2))
         self.pathOnline = np.zeros((self.pathLenMax, 2))
+    #    self.pathFront[0,:]= [1,1]
         self.frameQueue = queue.Queue()
         self.inputindex = 1
         self.scoreindex = 1
@@ -70,22 +77,27 @@ class OnlineDTW(QObject):
         #cost matrix, as i've written it.
         #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         if self.scoreindex < self.framenumscore:
-            print(f'path online index is {self.pathOnlineIndex}')
-            print(f'score index (J) is {self.scoreindex}')
+            #print(f'path online index is {self.pathOnlineIndex}')
+            #print(f'score index (J) is {self.scoreindex}')
 
             if self.needNewFrame == 1 and not self.inputQueue.empty():
                 inputData = self.inputQueue.get_nowait()
-                self.frameQueue.put_nowait(inputData)
+                #print(f'fnum is {self.fnum)
                 if self.fnum == 0:
                     self.fnum = self.fnum + 1
-                    self.audioChroma[:,0] = self.scoreChroma[:,0]# self.frameQueue.get_nowait() #
+                    #print(f"after {self.audioChroma[:,0]}")
+                    self.audioChroma[:,0] = inputData #
+                    #print(f"after {self.audioChroma[:,0]}")
                     diff = np.linalg.norm(self.scoreChroma[:,0] - self.audioChroma[:,0])
+                    #print(diff)
                     self.localEuclideanDistance[0,0]= diff
                     self.globalPathCost[0,0] = self.localEuclideanDistance[0,0]
                 else:
                     self.fnum +=1
-                    self.audioChroma[:,self.inputindex] = self.scoreChroma[:,self.inputindex] #self.framequeue.get_nowait()
+                    self.audioChroma[:,self.inputindex] = inputData
                     np.place(self.audioChroma[:,self.inputindex], np.isnan(self.audioChroma[:,self.inputindex]), 0)
+            #print(f"audio chroma is {self.audioChroma[:,self.inputindex]}")
+            #print(f"score chroma is {self.scoreChroma[:,self.scoreindex]}")
 
             self.needNewFrame = 0
             direction = self._getInc()
@@ -107,14 +119,17 @@ class OnlineDTW(QObject):
                 self.inputindex += 1
 
             test = direction==self.previous
+            #print(f"is direction == self.previous? {test}")
             if test == True:
                 self.runCount += 1
             else:
                 self.runCount = 1
+            #print(f'self.runCount is {self.runCount}')
             if direction != "B":
                 self.previous = direction
             # end loop
-
+##get direction ##################################
+##################################################
     def _getInc(self):
         '''
         _getInc: takes input index, score index as arguments and returns a
@@ -139,11 +154,13 @@ class OnlineDTW(QObject):
             path1 = path1.flatten()
             path2 = path2.flatten()
 
+
         for sidx in range(len(path1)):
             path1[sidx] = path1[sidx] / sqrt(sidx**2 + (self.scoreindex-1)**2)
-
+            #path1[sidx] = path1[sidx] / (sidx + (self.scoreindex-1))
         for iidx in range(len(path2)):
             path2[iidx] = path2[iidx] / sqrt(iidx**2 + self.inputindex-1**2)
+            #path2[iidx] = path2[iidx] / (iidx + (self.inputindex-1))
 
         if len(path1) > 0:
             minOfPath1 = np.min(path1)
@@ -166,13 +183,20 @@ class OnlineDTW(QObject):
             y = self.scoreindex-1
         self.pathOnlineIndex +=1
         self.pathOnline[self.pathOnlineIndex,:] = [x, y]
+        #print(f"current alignment point is ({x}, {y}")
+
         seencues = []
         for cue in self.cuelist:
                 if self.scoreindex-1 == cue[0] and cue[1] not in seencues:
                     self.signalToOSCclient.emit(cue[1])
                     seencues.append(cue[1])
 
-        self.signalToGUIThread.emit(self.pathOnline, self.globalPathCost)
+        #self.pathFront[self.pathOnlineIndex,:] = [self.scoreindex-1-1, self.inputindex-1]
+        # (i don't know what we need this for? but it was in bochen's code)
+
+
+        self.signalToGUIThread.emit(self.pathOnline)
+
 
         if self.runCount > self.maxRunCount:
             if self.previous == "R":
@@ -198,7 +222,11 @@ class OnlineDTW(QObject):
         cost of cell is based on cost of previous cells in the vertical,
         horizonal, or diagonal direction backward, hence /dynamic/ time warping.
         '''
+
+
+        #print(self.scoreChroma[:,scoreindex])
         diff = np.linalg.norm(self.scoreChroma[:,scoreindex]-self.audioChroma[:,inputindex])
+        #print(f'diff is {diff}')
         self.localEuclideanDistance[scoreindex, inputindex] = diff
 
         pathCost = np.min(((self.globalPathCost[scoreindex,inputindex-1] +
@@ -209,4 +237,5 @@ class OnlineDTW(QObject):
 
                        (self.globalPathCost[scoreindex-1,inputindex-1]+
                             (2*diff))))
+        #print(f'pathCost is {pathCost}')
         return pathCost

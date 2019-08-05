@@ -80,7 +80,7 @@ class App(QMainWindow):
         self.chromatizer.moveToThread(self.chromaThread)
         self.onlineDTW = OnlineDTW(self.scorechroma.chroma, self.chromaQueue, cues)
         self.onlineDTW.moveToThread(self.dtwThread)
-        self.oscclient = OSCclient(ip = "10.5.30.72")
+        self.oscclient = OSCclient(ip = "10.123.85.48")
         self.oscclient.moveToThread(self.oscthread)
         self.audioThread.start()
         self.chromaThread.start()
@@ -95,10 +95,9 @@ class App(QMainWindow):
         self.chromatizer.signalToOnlineDTW.connect(self.onlineDTW.align)
         self.onlineDTW.signalToGUIThread.connect(self.plotter)
         self.onlineDTW.signalToOSCclient.connect(self.oscclient.emit)
-        #self.onlineDTW.signalToPlotter.connect(self.plotter.animate)
 
-    @pyqtSlot(object, object)
-    def plotter(self, line, matrix):
+    @pyqtSlot(object)
+    def plotter(self, line):
         line.sort(axis = 0)
         self.curve.setData(line)
 
