@@ -14,7 +14,7 @@ class OSCclient(QObject):
         self.client = udp_client.UDPClient(ip, port)
     pyqtSlot(object)
     def emit(self, cuenum):
-        msg_raw = f"/cue/{cuenum}/startAndAutoloadNext"
+        msg_raw = f"/cue/{cuenum}/start"
         print(f'{msg_raw} sent')
         msg = osc_message_builder.OscMessageBuilder(msg_raw)
         msg = msg.build()

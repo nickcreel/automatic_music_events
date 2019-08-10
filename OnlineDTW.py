@@ -187,9 +187,9 @@ class OnlineDTW(QObject):
 
         seencues = []
         for cue in self.cuelist:
-                if self.scoreindex-1 == cue[0] and cue[1] not in seencues:
-                    self.signalToOSCclient.emit(cue[1])
-                    seencues.append(cue[1])
+            if self.scoreindex + 1  == cue[0] and cue[1] not in seencues:
+                self.signalToOSCclient.emit(cue[1])
+                seencues.append(cue[1])
 
         #self.pathFront[self.pathOnlineIndex,:] = [self.scoreindex-1-1, self.inputindex-1]
         # (i don't know what we need this for? but it was in bochen's code)
